@@ -50,6 +50,29 @@ func TestNormalizeRunMode(t *testing.T) {
 	}
 }
 
+func TestNormalizeOpenAIWSRoutingStrategy(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+		ok       bool
+	}{
+		{"", OpenAIWSRoutingStrategyWeighted, true},
+		{"weighted", OpenAIWSRoutingStrategyWeighted, true},
+		{"load_balance", OpenAIWSRoutingStrategyWeighted, true},
+		{"round-robin", OpenAIWSRoutingStrategyRoundRobin, true},
+		{"round_robin", OpenAIWSRoutingStrategyRoundRobin, true},
+		{"strict-round-robin", OpenAIWSRoutingStrategyStrictRoundRobin, true},
+		{"strict_round_robin", OpenAIWSRoutingStrategyStrictRoundRobin, true},
+		{"bad", "bad", false},
+	}
+
+	for _, tt := range tests {
+		result, ok := NormalizeOpenAIWSRoutingStrategy(tt.input)
+		require.Equal(t, tt.expected, result)
+		require.Equal(t, tt.ok, ok)
+	}
+}
+
 func TestLoadDefaultSchedulingConfig(t *testing.T) {
 	resetViperWithJWTSecret(t)
 
@@ -106,6 +129,9 @@ func TestLoadDefaultOpenAIWSConfig(t *testing.T) {
 	}
 	if cfg.Gateway.OpenAIWS.StickySessionTTLSeconds != 3600 {
 		t.Fatalf("Gateway.OpenAIWS.StickySessionTTLSeconds = %d, want 3600", cfg.Gateway.OpenAIWS.StickySessionTTLSeconds)
+	}
+	if cfg.Gateway.OpenAIWS.RoutingStrategy != OpenAIWSRoutingStrategyWeighted {
+		t.Fatalf("Gateway.OpenAIWS.RoutingStrategy = %q, want %q", cfg.Gateway.OpenAIWS.RoutingStrategy, OpenAIWSRoutingStrategyWeighted)
 	}
 	if !cfg.Gateway.OpenAIWS.SessionHashReadOldFallback {
 		t.Fatalf("Gateway.OpenAIWS.SessionHashReadOldFallback = false, want true")
@@ -1597,6 +1623,11 @@ func TestValidateConfig_OpenAIWSRules(t *testing.T) {
 			name:    "retry_total_budget_ms 不能为负数",
 			mutate:  func(c *Config) { c.Gateway.OpenAIWS.RetryTotalBudgetMS = -1 },
 			wantErr: "gateway.openai_ws.retry_total_budget_ms",
+		},
+		{
+			name:    "routing_strategy must be valid",
+			mutate:  func(c *Config) { c.Gateway.OpenAIWS.RoutingStrategy = "invalid" },
+			wantErr: "gateway.openai_ws.routing_strategy",
 		},
 		{
 			name:    "lb_top_k 必须为正数",

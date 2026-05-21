@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -21,6 +22,8 @@ const (
 	openAIAccountScheduleLayerPreviousResponse = "previous_response_id"
 	openAIAccountScheduleLayerSessionSticky    = "session_hash"
 	openAIAccountScheduleLayerLoadBalance      = "load_balance"
+	openAIAccountScheduleLayerRoundRobin       = "round_robin"
+	openAIAccountScheduleLayerStrictRoundRobin = "strict_round_robin"
 	openAIAdvancedSchedulerSettingKey          = "openai_advanced_scheduler_enabled"
 )
 
@@ -105,7 +108,9 @@ func (m *openAIAccountSchedulerMetrics) recordSelect(decision OpenAIAccountSched
 	if decision.StickySessionHit {
 		m.stickySessionHitTotal.Add(1)
 	}
-	if decision.Layer == openAIAccountScheduleLayerLoadBalance {
+	if decision.Layer == openAIAccountScheduleLayerLoadBalance ||
+		decision.Layer == openAIAccountScheduleLayerRoundRobin ||
+		decision.Layer == openAIAccountScheduleLayerStrictRoundRobin {
 		m.loadBalanceSelectTotal.Add(1)
 	}
 }
@@ -225,9 +230,11 @@ func (s *openAIAccountRuntimeStats) size() int {
 }
 
 type defaultOpenAIAccountScheduler struct {
-	service *OpenAIGatewayService
-	metrics openAIAccountSchedulerMetrics
-	stats   *openAIAccountRuntimeStats
+	service           *OpenAIGatewayService
+	metrics           openAIAccountSchedulerMetrics
+	stats             *openAIAccountRuntimeStats
+	roundRobinMu      sync.Mutex
+	roundRobinCursors map[string]uint64
 }
 
 func newDefaultOpenAIAccountScheduler(service *OpenAIGatewayService, stats *openAIAccountRuntimeStats) OpenAIAccountScheduler {
@@ -251,48 +258,72 @@ func (s *defaultOpenAIAccountScheduler) Select(
 		s.metrics.recordSelect(decision)
 	}()
 
-	previousResponseID := strings.TrimSpace(req.PreviousResponseID)
-	if previousResponseID != "" {
-		selection, err := s.service.SelectAccountByPreviousResponseID(
-			ctx,
-			req.GroupID,
-			previousResponseID,
-			req.RequestedModel,
-			req.ExcludedIDs,
-			req.RequireCompact,
-		)
+	strategy := s.service.openAIWSRoutingStrategy()
+	strictRoundRobin := strategy == config.OpenAIWSRoutingStrategyStrictRoundRobin
+	if !strictRoundRobin {
+		previousResponseID := strings.TrimSpace(req.PreviousResponseID)
+		if previousResponseID != "" {
+			selection, err := s.service.SelectAccountByPreviousResponseID(
+				ctx,
+				req.GroupID,
+				previousResponseID,
+				req.RequestedModel,
+				req.ExcludedIDs,
+				req.RequireCompact,
+			)
+			if err != nil {
+				return nil, decision, err
+			}
+			if selection != nil && selection.Account != nil {
+				if !s.isAccountTransportCompatible(selection.Account, req.RequiredTransport) {
+					if selection.ReleaseFunc != nil {
+						selection.ReleaseFunc()
+					}
+					selection = nil
+				}
+			}
+			if selection != nil && selection.Account != nil {
+				decision.Layer = openAIAccountScheduleLayerPreviousResponse
+				decision.StickyPreviousHit = true
+				decision.SelectedAccountID = selection.Account.ID
+				decision.SelectedAccountType = selection.Account.Type
+				if req.SessionHash != "" {
+					_ = s.service.BindStickySession(ctx, req.GroupID, req.SessionHash, selection.Account.ID)
+				}
+				return selection, decision, nil
+			}
+		}
+
+		selection, err := s.selectBySessionHash(ctx, req)
 		if err != nil {
 			return nil, decision, err
 		}
 		if selection != nil && selection.Account != nil {
-			if !s.isAccountTransportCompatible(selection.Account, req.RequiredTransport) {
-				if selection.ReleaseFunc != nil {
-					selection.ReleaseFunc()
-				}
-				selection = nil
-			}
-		}
-		if selection != nil && selection.Account != nil {
-			decision.Layer = openAIAccountScheduleLayerPreviousResponse
-			decision.StickyPreviousHit = true
+			decision.Layer = openAIAccountScheduleLayerSessionSticky
+			decision.StickySessionHit = true
 			decision.SelectedAccountID = selection.Account.ID
 			decision.SelectedAccountType = selection.Account.Type
-			if req.SessionHash != "" {
-				_ = s.service.BindStickySession(ctx, req.GroupID, req.SessionHash, selection.Account.ID)
-			}
 			return selection, decision, nil
 		}
 	}
 
-	selection, err := s.selectBySessionHash(ctx, req)
-	if err != nil {
-		return nil, decision, err
-	}
-	if selection != nil && selection.Account != nil {
-		decision.Layer = openAIAccountScheduleLayerSessionSticky
-		decision.StickySessionHit = true
-		decision.SelectedAccountID = selection.Account.ID
-		decision.SelectedAccountType = selection.Account.Type
+	if strategy == config.OpenAIWSRoutingStrategyRoundRobin || strictRoundRobin {
+		selection, candidateCount, topK, loadSkew, err := s.selectByRoundRobin(ctx, req, !strictRoundRobin)
+		if strictRoundRobin {
+			decision.Layer = openAIAccountScheduleLayerStrictRoundRobin
+		} else {
+			decision.Layer = openAIAccountScheduleLayerRoundRobin
+		}
+		decision.CandidateCount = candidateCount
+		decision.TopK = topK
+		decision.LoadSkew = loadSkew
+		if err != nil {
+			return nil, decision, err
+		}
+		if selection != nil && selection.Account != nil {
+			decision.SelectedAccountID = selection.Account.ID
+			decision.SelectedAccountType = selection.Account.Type
+		}
 		return selection, decision, nil
 	}
 
@@ -584,6 +615,285 @@ func buildOpenAIWeightedSelectionOrder(
 		weights = append(weights[:selectedIdx], weights[selectedIdx+1:]...)
 	}
 	return order
+}
+
+func (s *defaultOpenAIAccountScheduler) listOpenAIAccountCandidates(
+	ctx context.Context,
+	req OpenAIAccountScheduleRequest,
+) ([]openAIAccountCandidateScore, error) {
+	accounts, err := s.service.listSchedulableAccounts(ctx, req.GroupID)
+	if err != nil {
+		return nil, err
+	}
+	if len(accounts) == 0 {
+		return nil, noAvailableOpenAISelectionError(req.RequestedModel, false)
+	}
+
+	var schedGroup *Group
+	if req.GroupID != nil && s.service.schedulerSnapshot != nil {
+		schedGroup, _ = s.service.schedulerSnapshot.GetGroupByID(ctx, *req.GroupID)
+	}
+
+	filtered := make([]*Account, 0, len(accounts))
+	loadReq := make([]AccountWithConcurrency, 0, len(accounts))
+	for i := range accounts {
+		account := &accounts[i]
+		if req.ExcludedIDs != nil {
+			if _, excluded := req.ExcludedIDs[account.ID]; excluded {
+				continue
+			}
+		}
+		if !account.IsSchedulable() || !account.IsOpenAI() {
+			continue
+		}
+		if schedGroup != nil && schedGroup.RequirePrivacySet && !account.IsPrivacySet() {
+			_ = s.service.accountRepo.SetError(ctx, account.ID,
+				fmt.Sprintf("Privacy not set, required by group [%s]", schedGroup.Name))
+			continue
+		}
+		if !s.isAccountRequestCompatible(ctx, account, req) {
+			continue
+		}
+		if !s.isAccountTransportCompatible(account, req.RequiredTransport) {
+			continue
+		}
+		filtered = append(filtered, account)
+		loadReq = append(loadReq, AccountWithConcurrency{
+			ID:             account.ID,
+			MaxConcurrency: account.EffectiveLoadFactor(),
+		})
+	}
+	if len(filtered) == 0 {
+		return nil, noAvailableOpenAISelectionError(req.RequestedModel, false)
+	}
+
+	loadMap := map[int64]*AccountLoadInfo{}
+	if s.service.concurrencyService != nil {
+		if batchLoad, loadErr := s.service.concurrencyService.GetAccountsLoadBatch(ctx, loadReq); loadErr == nil {
+			loadMap = batchLoad
+		}
+	}
+
+	allCandidates := make([]openAIAccountCandidateScore, 0, len(filtered))
+	for _, account := range filtered {
+		loadInfo := loadMap[account.ID]
+		if loadInfo == nil {
+			loadInfo = &AccountLoadInfo{AccountID: account.ID}
+		}
+		errorRate, ttft, hasTTFT := 0.0, 0.0, false
+		if s.stats != nil {
+			errorRate, ttft, hasTTFT = s.stats.snapshot(account.ID)
+		}
+		allCandidates = append(allCandidates, openAIAccountCandidateScore{
+			account:   account,
+			loadInfo:  loadInfo,
+			errorRate: errorRate,
+			ttft:      ttft,
+			hasTTFT:   hasTTFT,
+		})
+	}
+	return allCandidates, nil
+}
+
+func selectOpenAIRoundRobinPriorityBucket(candidates []openAIAccountCandidateScore) []openAIAccountCandidateScore {
+	if len(candidates) == 0 {
+		return nil
+	}
+	bestPriority := candidates[0].account.Priority
+	for _, candidate := range candidates[1:] {
+		if candidate.account.Priority < bestPriority {
+			bestPriority = candidate.account.Priority
+		}
+	}
+
+	bucket := make([]openAIAccountCandidateScore, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.account.Priority == bestPriority {
+			bucket = append(bucket, candidate)
+		}
+	}
+	sort.Slice(bucket, func(i, j int) bool {
+		return bucket[i].account.ID < bucket[j].account.ID
+	})
+	return bucket
+}
+
+func openAIRoundRobinCursorKey(req OpenAIAccountScheduleRequest, scope string) string {
+	groupKey := "ungrouped"
+	if req.GroupID != nil {
+		groupKey = strconv.FormatInt(*req.GroupID, 10)
+	}
+	modelKey := strings.ToLower(strings.TrimSpace(req.RequestedModel))
+	if modelKey == "" {
+		modelKey = "*"
+	}
+	if scope != "" {
+		return groupKey + ":openai:" + modelKey + ":" + scope
+	}
+	return groupKey + ":openai:" + modelKey
+}
+
+func (s *defaultOpenAIAccountScheduler) buildOpenAIRoundRobinSelectionOrder(
+	candidates []openAIAccountCandidateScore,
+	req OpenAIAccountScheduleRequest,
+	scope string,
+) []openAIAccountCandidateScore {
+	bucket := selectOpenAIRoundRobinPriorityBucket(candidates)
+	if len(bucket) <= 1 {
+		return append([]openAIAccountCandidateScore(nil), bucket...)
+	}
+
+	key := openAIRoundRobinCursorKey(req, scope)
+	s.roundRobinMu.Lock()
+	if s.roundRobinCursors == nil {
+		s.roundRobinCursors = make(map[string]uint64)
+	}
+	index := s.roundRobinCursors[key]
+	if index >= 2_147_483_640 {
+		index = 0
+	}
+	s.roundRobinCursors[key] = index + 1
+	s.roundRobinMu.Unlock()
+
+	start := int(index % uint64(len(bucket)))
+	order := make([]openAIAccountCandidateScore, 0, len(bucket))
+	for i := 0; i < len(bucket); i++ {
+		order = append(order, bucket[(start+i)%len(bucket)])
+	}
+	return order
+}
+
+func sortOpenAIRoundRobinFallbackCandidates(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {
+	if len(pool) == 0 {
+		return nil
+	}
+	ordered := append([]openAIAccountCandidateScore(nil), pool...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		a, b := ordered[i], ordered[j]
+		if a.account.Priority != b.account.Priority {
+			return a.account.Priority < b.account.Priority
+		}
+		if a.loadInfo.LoadRate != b.loadInfo.LoadRate {
+			return a.loadInfo.LoadRate < b.loadInfo.LoadRate
+		}
+		if a.loadInfo.WaitingCount != b.loadInfo.WaitingCount {
+			return a.loadInfo.WaitingCount < b.loadInfo.WaitingCount
+		}
+		return a.account.ID < b.account.ID
+	})
+	return ordered
+}
+
+func (s *defaultOpenAIAccountScheduler) selectByRoundRobin(
+	ctx context.Context,
+	req OpenAIAccountScheduleRequest,
+	bindSticky bool,
+) (*AccountSelectionResult, int, int, float64, error) {
+	allCandidates, err := s.listOpenAIAccountCandidates(ctx, req)
+	if err != nil {
+		return nil, 0, 0, 0, err
+	}
+
+	candidates := allCandidates
+	staleSnapshotCompactRetry := make([]openAIAccountCandidateScore, 0, len(allCandidates))
+	if req.RequireCompact {
+		candidates = make([]openAIAccountCandidateScore, 0, len(allCandidates))
+		for _, candidate := range allCandidates {
+			if openAICompactSupportTier(candidate.account) == 0 {
+				staleSnapshotCompactRetry = append(staleSnapshotCompactRetry, candidate)
+				continue
+			}
+			candidates = append(candidates, candidate)
+		}
+		if len(candidates) == 0 && len(staleSnapshotCompactRetry) == 0 {
+			return nil, 0, 0, 0, ErrNoAvailableCompactAccounts
+		}
+	}
+
+	candidateCount := len(candidates)
+	selectionOrder := make([]openAIAccountCandidateScore, 0, len(allCandidates))
+	if req.RequireCompact {
+		supported := make([]openAIAccountCandidateScore, 0, len(candidates))
+		unknown := make([]openAIAccountCandidateScore, 0, len(candidates))
+		for _, candidate := range candidates {
+			switch openAICompactSupportTier(candidate.account) {
+			case 2:
+				supported = append(supported, candidate)
+			case 1:
+				unknown = append(unknown, candidate)
+			}
+		}
+		if len(supported) == 0 && len(unknown) == 0 && s.service.schedulerSnapshot == nil {
+			return nil, candidateCount, 0, 0, ErrNoAvailableCompactAccounts
+		}
+		selectionOrder = append(selectionOrder, s.buildOpenAIRoundRobinSelectionOrder(supported, req, "compact_supported")...)
+		selectionOrder = append(selectionOrder, s.buildOpenAIRoundRobinSelectionOrder(unknown, req, "compact_unknown")...)
+		if len(staleSnapshotCompactRetry) > 0 && s.service.schedulerSnapshot != nil {
+			selectionOrder = append(selectionOrder, sortOpenAIRoundRobinFallbackCandidates(staleSnapshotCompactRetry)...)
+		}
+	} else {
+		selectionOrder = s.buildOpenAIRoundRobinSelectionOrder(candidates, req, "")
+	}
+	if len(selectionOrder) == 0 {
+		return nil, candidateCount, 0, 0, noAvailableOpenAISelectionError(req.RequestedModel, req.RequireCompact && len(allCandidates) > 0)
+	}
+
+	compactBlocked := false
+	for _, candidate := range selectionOrder {
+		fresh := s.service.resolveFreshSchedulableOpenAIAccount(ctx, candidate.account, req.RequestedModel, false)
+		if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
+			continue
+		}
+		fresh = s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.RequestedModel, false)
+		if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
+			continue
+		}
+		if req.RequireCompact && openAICompactSupportTier(fresh) == 0 {
+			compactBlocked = true
+			continue
+		}
+		result, acquireErr := s.service.tryAcquireAccountSlot(ctx, fresh.ID, fresh.Concurrency)
+		if acquireErr != nil {
+			return nil, candidateCount, len(selectionOrder), 0, acquireErr
+		}
+		if result != nil && result.Acquired {
+			if bindSticky && req.SessionHash != "" {
+				_ = s.service.BindStickySession(ctx, req.GroupID, req.SessionHash, fresh.ID)
+			}
+			return &AccountSelectionResult{
+				Account:     fresh,
+				Acquired:    true,
+				ReleaseFunc: result.ReleaseFunc,
+			}, candidateCount, len(selectionOrder), 0, nil
+		}
+	}
+
+	cfg := s.service.schedulingConfig()
+	for _, candidate := range selectionOrder {
+		fresh := s.service.resolveFreshSchedulableOpenAIAccount(ctx, candidate.account, req.RequestedModel, false)
+		if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
+			continue
+		}
+		fresh = s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.RequestedModel, false)
+		if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
+			continue
+		}
+		if req.RequireCompact && openAICompactSupportTier(fresh) == 0 {
+			compactBlocked = true
+			continue
+		}
+		return &AccountSelectionResult{
+			Account: fresh,
+			WaitPlan: &AccountWaitPlan{
+				AccountID:      fresh.ID,
+				MaxConcurrency: fresh.Concurrency,
+				Timeout:        cfg.FallbackWaitTimeout,
+				MaxWaiting:     cfg.FallbackMaxWaiting,
+			},
+		}, candidateCount, len(selectionOrder), 0, nil
+	}
+
+	return nil, candidateCount, len(selectionOrder), 0, noAvailableOpenAISelectionError(req.RequestedModel, compactBlocked)
 }
 
 func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
@@ -1196,6 +1506,15 @@ func (s *OpenAIGatewayService) openAIWSLBTopK() int {
 		return s.cfg.Gateway.OpenAIWS.LBTopK
 	}
 	return 7
+}
+
+func (s *OpenAIGatewayService) openAIWSRoutingStrategy() string {
+	if s != nil && s.cfg != nil {
+		if strategy, ok := config.NormalizeOpenAIWSRoutingStrategy(s.cfg.Gateway.OpenAIWS.RoutingStrategy); ok {
+			return strategy
+		}
+	}
+	return config.OpenAIWSRoutingStrategyWeighted
 }
 
 func (s *OpenAIGatewayService) openAIWSSchedulerWeights() GatewayOpenAIWSSchedulerScoreWeightsView {
